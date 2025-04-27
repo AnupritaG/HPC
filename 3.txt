@@ -1,0 +1,72 @@
+#include <iostream>
+#include <cuda.h>
+#include <cstdlib>
+#include <cmath>
+#include <ctime>
+using namespace std;
+
+__global__ void reduceMinMaxSum(float *in, float *minV, float *maxV, float *sumV, int N) {
+    __shared__ float sMin[256], sMax[256], sSum[256];
+    int tid = threadIdx.x + blockIdx.x * blockDim.x, i = threadIdx.x;
+    sMin[i] = (tid < N) ? in[tid] : FLT_MAX;
+    sMax[i] = (tid < N) ? in[tid] : -FLT_MAX;
+    sSum[i] = (tid < N) ? in[tid] : 0.0f;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (i < s) {
+            sMin[i] = fminf(sMin[i], sMin[i+s]);
+            sMax[i] = fmaxf(sMax[i], sMax[i+s]);
+            sSum[i] += sSum[i+s];
+        }
+        __syncthreads();
+    }
+    if (i == 0) {
+        atomicMin((int*)minV, __float_as_int(sMin[0]));
+        atomicMax((int*)maxV, __float_as_int(sMax[0]));
+        atomicAdd(sumV, sSum[0]);
+    }
+}
+
+__global__ void reduceStdDev(float *in, float mean, float *stdV, int N) {
+    __shared__ float sVar[256];
+    int tid = threadIdx.x + blockIdx.x * blockDim.x, i = threadIdx.x;
+    sVar[i] = (tid < N) ? (in[tid] - mean)*(in[tid] - mean) : 0;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (i < s) sVar[i] += sVar[i+s];
+        __syncthreads();
+    }
+    if (i == 0) atomicAdd(stdV, sVar[0]);
+}
+
+int main() {
+    const int N = 1<<20;
+    float *h=new float[N], *d, *d_min, *d_max, *d_sum, *d_std;
+    for (int i=0; i<N; i++) h[i]=rand()%1000;
+    cudaMalloc(&d,N*sizeof(float));
+    cudaMalloc(&d_min,sizeof(float)); cudaMalloc(&d_max,sizeof(float));
+    cudaMalloc(&d_sum,sizeof(float)); cudaMalloc(&d_std,sizeof(float));
+    cudaMemcpy(d,h,N*sizeof(float),cudaMemcpyHostToDevice);
+    float initMin=FLT_MAX, initMax=-FLT_MAX;
+    cudaMemcpy(d_min,&initMin,sizeof(float),cudaMemcpyHostToDevice);
+    cudaMemcpy(d_max,&initMax,sizeof(float),cudaMemcpyHostToDevice);
+    cudaMemset(d_sum,0,sizeof(float)); cudaMemset(d_std,0,sizeof(float));
+
+    clock_t start=clock();
+    reduceMinMaxSum<<<(N+255)/256,256>>>(d,d_min,d_max,d_sum,N);
+    cudaDeviceSynchronize();
+    float minV,maxV,sumV;
+    cudaMemcpy(&minV,d_min,sizeof(float),cudaMemcpyDeviceToHost);
+    cudaMemcpy(&maxV,d_max,sizeof(float),cudaMemcpyDeviceToHost);
+    cudaMemcpy(&sumV,d_sum,sizeof(float),cudaMemcpyDeviceToHost);
+    float mean=sumV/N;
+    reduceStdDev<<<(N+255)/256,256>>>(d,mean,d_std,N);
+    cudaDeviceSynchronize();
+    float stdV;
+    cudaMemcpy(&stdV,d_std,sizeof(float),cudaMemcpyDeviceToHost);
+    cout<<"Max:"<<maxV<<" Min:"<<minV<<" Mean:"<<mean<<" StdDev:"<<sqrt(stdV/N);
+    cout<<"\nTime:"<<(double)(clock()-start)/CLOCKS_PER_SEC<<" sec\n";
+
+    cudaFree(d); cudaFree(d_min); cudaFree(d_max); cudaFree(d_sum); cudaFree(d_std); delete[] h;
+}
+
